@@ -48,7 +48,7 @@ def print_status(source, status):
 
 
 def stream(source, api_url):
-    url = f"{api_url.rstrip('/')}/api/{source}/events?limit=1000"
+    url = f"{api_url.rstrip('/')}/api/{source}/events?limit=5"
     watermark = None
     previous_error = None
     previous_status = None
