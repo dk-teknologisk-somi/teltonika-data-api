@@ -6,6 +6,7 @@ Teltonika RUT956 router (`192.168.1.1`) and serves it as JSON on
 
 Interactive API docs: <http://127.0.0.1:8000/docs>
 
+
 ## Run
 
 | How | Command |
@@ -177,19 +178,6 @@ sh scripts/print_data.sh
 
 Choose GNSS, rs232 or rs485. Prints new data as it arrives, plus connection
 status changes.
-
-## Test an RS-3005P Power Supply
-
-```sh
-sh scripts/test_psu.sh            # steps 1, 3.3, 5, 9, 12 V
-sh scripts/test_psu.sh 2 4 6      # custom voltages
-```
-
-Talks to an RS PRO RS-3005P/6005P (Korad protocol) on RS232 through the API.
-It sets a 0.1 A current limit (`CURRENT_LIMIT=0.5` to change), turns the
-output on, steps through the voltages, and prints the setpoint, measured
-voltage/current and CV/CC mode. The output is always turned off at the end.
-Set the router's RS232 port to 9600 baud, 8N1, flow control none.
 
 ## Build the Executable
 
