@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import os
 from collections import deque
 from contextlib import asynccontextmanager, suppress
@@ -9,7 +10,10 @@ from typing import Literal
 
 import pynmea2
 import uvicorn
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, model_validator
+
+MAX_SEND_BYTES = 4096
 
 
 def now() -> datetime:
@@ -66,6 +70,7 @@ class Collector:
         self.server: asyncio.Server | None = None
         self.tasks: set[asyncio.Task] = set()
         self.gnss_connections = 0
+        self.writers: dict[str, asyncio.StreamWriter] = {}
 
     def record(self, source: str, event: dict) -> None:
         timestamp = now().isoformat()
@@ -163,18 +168,27 @@ class Collector:
                 )
                 state["connected"] = True
                 state["error"] = None
+                self.writers[source] = writer
                 while payload := await reader.read(4096):
                     self.ingest_serial(source, payload)
                 state["error"] = "Router closed connection; reconnecting"
             except (OSError, TimeoutError) as exc:
                 state["error"] = str(exc)
             finally:
+                self.writers.pop(source, None)
                 state["connected"] = False
                 if writer is not None:
                     writer.close()
                     with suppress(OSError):
                         await writer.wait_closed()
             await asyncio.sleep(self.settings.retry_seconds)
+
+    async def send_serial(self, source: str, payload: bytes) -> None:
+        writer = self.writers.get(source)
+        if writer is None:
+            raise ConnectionError(f"{source} is not connected to the router")
+        writer.write(payload)
+        await writer.drain()
 
     async def start(self) -> None:
         self.server = await asyncio.start_server(
@@ -200,6 +214,28 @@ class Collector:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     collector = Collector(settings or Settings.from_env())
+
+    class SendRequest(BaseModel):
+        text: str | None = None
+        base64: str | None = None
+
+        @model_validator(mode="after")
+        def _validate(self) -> "SendRequest":
+            if (self.text is None) == (self.base64 is None):
+                raise ValueError("provide exactly one of 'text' or 'base64'")
+            try:
+                payload = self.payload()
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError(f"invalid base64: {exc}") from exc
+            if not 1 <= len(payload) <= MAX_SEND_BYTES:
+                raise ValueError(f"payload must be 1 to {MAX_SEND_BYTES} bytes")
+            return self
+
+        def payload(self) -> bytes:
+            if self.text is not None:
+                return self.text.encode("utf-8")
+            return base64.b64decode(self.base64, validate=True)
+
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -242,6 +278,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "source": source,
             "status": collector.status(source),
             "events": list(collector.events[source])[-limit:],
+        }
+
+    @app.post("/api/{source}/send")
+    async def send(source: Literal["rs232", "rs485"], request: SendRequest):
+        payload = request.payload()
+        try:
+            await collector.send_serial(source, payload)
+        except (ConnectionError, OSError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {
+            "source": source,
+            "sent_bytes": len(payload),
+            "sent_at": now().isoformat(),
         }
 
     return app

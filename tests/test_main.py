@@ -1,10 +1,15 @@
 import asyncio
 import base64
+import sys
 import unittest
 from datetime import timedelta
+from pathlib import Path
 
+import httpx
 import pynmea2
 from fastapi.testclient import TestClient
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from main import Collector, Settings, create_app, now
 
@@ -56,6 +61,20 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(client.get("/api/unknown/events").status_code, 422)
             self.assertEqual(client.get("/api/gnss/events?limit=0").status_code, 422)
 
+    def test_send_validation_and_unavailable(self):
+        app = create_app(Settings(gnss_bind="127.0.0.1", gnss_port=0,
+                                  rs232_port=None, rs485_port=None))
+        with TestClient(app) as client:
+            self.assertEqual(client.post("/api/rs232/send", json={"text": "hi"}).status_code, 503)
+            self.assertEqual(client.post("/api/rs232/send", json={}).status_code, 422)
+            self.assertEqual(
+                client.post("/api/rs232/send", json={"text": "a", "base64": "aGk="}).status_code,
+                422,
+            )
+            self.assertEqual(client.post("/api/rs232/send", json={"base64": "!!!"}).status_code, 422)
+            self.assertEqual(client.post("/api/rs232/send", json={"text": ""}).status_code, 422)
+            self.assertEqual(client.post("/api/gnss/send", json={"text": "hi"}).status_code, 422)
+
 
 class SocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_gnss_fragmented_tcp_and_shutdown(self):
@@ -105,6 +124,49 @@ class SocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            server.close()
+            await server.wait_closed()
+
+    async def test_send_roundtrip(self):
+        received = asyncio.Queue()
+
+        async def router(reader, writer):
+            while data := await reader.read(4096):
+                await received.put(data)
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(router, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        app = create_app(Settings(router_host="127.0.0.1", gnss_bind="127.0.0.1",
+                                  gnss_port=0, rs232_port=port, rs485_port=None,
+                                  retry_seconds=0.01))
+        collector = app.state.collector
+        await collector.start()
+        try:
+            async def connected():
+                while "rs232" not in collector.writers:
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(connected(), 2)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.post("/api/rs232/send", json={"text": "MEAS?\r\n"})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["sent_bytes"], 7)
+                response = await client.post(
+                    "/api/rs232/send",
+                    json={"base64": base64.b64encode(b"\x00\xff").decode("ascii")},
+                )
+                self.assertEqual(response.status_code, 200)
+                response = await client.post("/api/rs485/send", json={"text": "x"})
+                self.assertEqual(response.status_code, 503)
+            expected = b"MEAS?\r\n\x00\xff"
+            data = b""
+            while len(data) < len(expected):
+                data += await asyncio.wait_for(received.get(), 2)
+            self.assertEqual(data, expected)
+        finally:
+            await asyncio.wait_for(collector.close(), 2)
             server.close()
             await server.wait_closed()
 

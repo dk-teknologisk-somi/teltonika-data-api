@@ -1,7 +1,9 @@
 # Teltonika RUT956 Data API
 
-Read-only Python HTTP API for GNSS, RS232, and RS485 data from a router at
-`192.168.1.1`. Requires Python 3.11 or newer.
+Python HTTP API for GNSS, RS232, and RS485 data from a router at
+`192.168.1.1`. GNSS is read-only; RS232 and RS485 also support sending bytes
+to the attached device for polled (request/response) instruments. Requires
+Python 3.11 or newer.
 
 ## Protocol Choice
 
@@ -48,17 +50,63 @@ not change router configuration or use the RutOS management API.
 Menu labels can vary by firmware. No hardware configuration has been performed
 by this project.
 
+## Project Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/main.py` | The API service |
+| `tests/` | Unit tests |
+| `scripts/` | Start, stream-printing, and build scripts |
+| `requirements/` | `runtime.txt`, `dev.txt` (tests), `build.txt` (PyInstaller) |
+| `packaging/` | PyInstaller spec for the standalone executable |
+
 ## Run
 
 PowerShell, from the project directory:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe main.py
+.\.venv\Scripts\python.exe -m pip install -r requirements\runtime.txt
+.\.venv\Scripts\python.exe src\main.py
 ```
 
+On Linux (or Git Bash), `sh scripts/start_api.sh` creates `.venv`, installs
+dependencies if needed, and starts the API.
+
 Open API documentation at <http://127.0.0.1:8000/docs>.
+
+## Standalone Executable
+
+For tablets and other machines without Python, use the single-file executable.
+It bundles Python and all dependencies; no installation is required.
+
+1. Download the file for the tablet from the GitHub release (or the
+	**Build executables** workflow run's artifacts):
+	`teltonika-data-api-windows-x64.exe` (also runs on Windows on ARM via
+	emulation), `teltonika-data-api-linux-x64`, or
+	`teltonika-data-api-linux-arm64`.
+2. Windows: double-click the `.exe`. SmartScreen may warn about an unsigned
+	app (**More info > Run anyway**), and Windows Firewall asks to allow
+	network access the first time; allow it on private networks so the router
+	can forward GNSS to TCP 8500.
+3. Linux: `chmod +x teltonika-data-api-linux-x64` and run it. The Linux builds
+	need glibc 2.35 or newer (Ubuntu 22.04, Debian 12, or later).
+
+A console window shows the log; close it or press **Ctrl+C** to stop. The
+environment settings below work the same way for the executable.
+
+Pushing a tag such as `v1.0.0` builds all executables on GitHub Actions and
+attaches them to a release; the workflow can also be started manually.
+
+To build locally, run the script for the OS you are on. PyInstaller does not
+cross-compile, so build the Windows `.exe` on Windows and the Linux binary on
+Linux (on the same CPU architecture as the tablet). Both scripts need Python
+3.11+, create `.venv` if missing, and install `requirements/build.txt`.
+
+| OS | Command | Result |
+| --- | --- | --- |
+| Linux | `sh scripts/build_linux.sh` | `dist/teltonika-data-api` |
+| Windows | Double-click `scripts\build_windows.bat` | `dist\teltonika-data-api.exe` |
 
 Optional environment settings, applied before starting:
 
@@ -86,6 +134,27 @@ Use one service process only, since it owns the GNSS listening port.
 | `/api/rs232/events?limit=100` | Recent RS232 byte chunks |
 | `/api/rs485/events?limit=100` | Recent RS485 byte chunks |
 
+| POST endpoint | Result |
+| --- | --- |
+| `/api/rs232/send` | Send bytes out the RS232 port |
+| `/api/rs485/send` | Send bytes out the RS485 port |
+
+The send body is JSON with exactly one of `text` (UTF-8 encoded before
+sending) or `base64` (lossless, for binary or exact control characters),
+limited to 4096 decoded bytes. Line endings are not added automatically;
+include `\r\n` or whatever the device expects. Responses from the device
+appear in `/api/<source>/events` as usual. Sending returns `503` when the
+serial TCP connection to the router is down.
+
+```sh
+curl -X POST http://127.0.0.1:8000/api/rs232/send \
+	-H 'Content-Type: application/json' -d '{"text": "MEAS?\r\n"}'
+```
+
+Anyone who can reach the HTTP API can transmit arbitrary bytes to the serial
+devices. Keep the API bound to localhost, or restrict access before exposing
+it.
+
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/gnss
 Invoke-RestMethod http://127.0.0.1:8000/api/rs485/events
@@ -102,8 +171,8 @@ Serial results include lossless `base64` and `hex`, plus best-effort UTF-8
 `text`. TCP chunks are **not device messages**: a message can span chunks, or
 one chunk can contain several messages. Each source retains at most 1,000
 events in RAM, oldest first; data is lost on restart or overwritten at capacity.
-There is no durable storage, delivery acknowledgement, or write endpoint.
-Serial connections retry automatically after failures.
+There is no durable storage or delivery acknowledgement. Serial connections
+retry automatically after failures.
 
 ## Print a Stream
 
@@ -111,13 +180,15 @@ With the API running, execute the interactive script in Git Bash, WSL, or a
 Linux/macOS shell:
 
 ```sh
-sh print_data.sh
+sh scripts/print_data.sh
 ```
 
 Choose **GNSS**, **rs232**, or **rs485** (or **1**, **2**, **3**). The script
 prints retained events first, then polls once per second and prints new events.
 GNSS output is raw NMEA lines; serial output shows timestamps, escaped text,
-and lossless hex. Stop with **Ctrl+C**. It retries if the API is unavailable.
+and lossless hex. Stop with **Ctrl+C**. It retries if the API is unavailable,
+and reports the source's router connection status (on stderr) whenever it
+changes, so a silent stream shows why no data is arriving.
 Python 3 is required; the script selects the project's virtual environment when
 available. Windows PowerShell cannot execute shell scripts directly; use Git
 Bash or WSL.
@@ -125,7 +196,7 @@ Bash or WSL.
 To select a different API address:
 
 ```sh
-API_URL=http://127.0.0.1:8000 sh print_data.sh
+API_URL=http://127.0.0.1:8000 sh scripts/print_data.sh
 ```
 
 This is a best-effort live display, not a durable stream: events can be missed
@@ -143,7 +214,7 @@ authenticated TLS reverse proxy before exposing it beyond a trusted machine.
 ## Tests
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements\dev.txt
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
